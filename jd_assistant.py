@@ -45,7 +45,9 @@ class Assistant(object):
         self.fp = global_config.get('config', 'fp')
         self.track_id = global_config.get('config', 'track_id')
         self.risk_control = global_config.get('config', 'risk_control')
-        if not self.eid or not self.fp or not self.track_id or not self.risk_control:
+        #因self.risk_control可为空，故删除其是否为空的校验
+        if not self.eid or not self.fp or not self.track_id:
+            logger.info("eid: %s, fp: %s, track_id: %s, risk_control: %s", self.eid, self.fp, self.track_id, self.risk_control)
             raise AsstException('请在 config.ini 中配置 eid, fp, track_id, risk_control 参数，具体请参考 wiki-常见问题')
 
         self.timeout = float(global_config.get('config', 'timeout') or DEFAULT_TIMEOUT)
@@ -805,8 +807,13 @@ class Assistant(object):
         payload = {
             'rid': str(int(time.time() * 1000)),
         }
+        headers = {
+            'User-Agent': self.user_agent,
+            'Referer': 'https://cart.jd.com/',
+        }
         try:
-            resp = self.sess.get(url=url, params=payload)
+            #由于未设置userAgent导致京东报错（https://trade.jd.com/shopping/orderBack.html），现补充userAgent的设置
+            resp = self.sess.get(url=url, params=payload, headers=headers)
             if not response_status(resp):
                 logger.error('获取订单结算页信息失败')
                 return
@@ -820,20 +827,26 @@ class Assistant(object):
                 'total_price': soup.find('span', id='sumPayPriceId').text[1:],  # remove '￥' from the begin
                 'items': []
             }
-            # TODO: 这里可能会产生解析问题，待修复
-            # for item in soup.select('div.goods-list div.goods-items'):
-            #     div_tag = item.select('div.p-price')[0]
-            #     order_detail.get('items').append({
-            #         'name': get_tag_value(item.select('div.p-name a')),
-            #         'price': get_tag_value(div_tag.select('strong.jd-price'))[2:],  # remove '￥ ' from the begin
-            #         'num': get_tag_value(div_tag.select('span.p-num'))[1:],  # remove 'x' from the begin
-            #         'state': get_tag_value(div_tag.select('span.p-state'))  # in stock or out of stock
-            #     })
+            # 解析问题已修复
+            for item in soup.select('div.goods-list div.goods-items'):
+                div_tag = item.select('div.p-price')
+                #div_tag可能为空，如果为空则跳过
+                if not div_tag:
+                  continue
+                div_tag = div_tag[0]
+                order_detail.get('items').append({
+                    'name': get_tag_value(item.select('div.p-name a')),
+                    'price': get_tag_value(div_tag.select('strong.jd-price'))[2:],  # remove '￥ ' from the begin
+                    'num': get_tag_value(div_tag.select('span.p-num'))[1:],  # remove 'x' from the begin
+                    'state': get_tag_value(div_tag.select('span.p-state'))  # in stock or out of stock
+                })
 
             logger.info("下单信息：%s", order_detail)
             return order_detail
         except Exception as e:
-            logger.error('订单结算页面数据解析异常（可以忽略），报错信息：%s', e)
+            logger.error('订单结算页面数据解析异常（可能会产生配送方式错误而导致订单提交失败），报错信息：%s', e)
+            #如有解析错误则抛出异常，以便定位解析错误
+            #raise e
 
     def _save_invoice(self):
         """下单第三方商品时如果未设置发票，将从电子发票切换为普通发票
@@ -928,6 +941,9 @@ class Assistant(object):
             'Referer': 'http://trade.jd.com/shopping/order/getOrderInfo.action',
         }
 
+       	#提交订单前需获取订单信息，否则可能因配送信息错误导致订单提交失败
+        self.get_checkout_page_detail()        
+
         try:
             resp = self.sess.post(url=url, data=data, headers=headers)
             resp_json = json.loads(resp.text)
@@ -973,7 +989,6 @@ class Assistant(object):
         """
         for i in range(1, retry + 1):
             logger.info('第[%s/%s]次尝试提交订单', i, retry)
-            self.get_checkout_page_detail()
             if self.submit_order():
                 logger.info('第%s次提交订单成功', i)
                 return True
@@ -982,7 +997,7 @@ class Assistant(object):
                     logger.info('第%s次提交失败，%ss后重试', i, interval)
                     time.sleep(interval)
         else:
-            logger.info('重试提交%s次结束', retry)
+            logger.info('重试提交%s次结束，提交订单失败', retry)
             return False
 
     @check_login
@@ -998,15 +1013,9 @@ class Assistant(object):
         """
         t = Timer(buy_time=buy_time)
         t.start()
+        #统一使用submit_order_with_retry实现订单提交失败重试功能
+        self.submit_order_with_retry(retry, interval)
 
-        for count in range(1, retry + 1):
-            logger.info('第[%s/%s]次尝试提交订单', count, retry)
-            if self.submit_order():
-                break
-            logger.info('休息%ss', interval)
-            time.sleep(interval)
-        else:
-            logger.info('执行结束，提交订单失败！')
 
     @check_login
     def get_order_info(self, unpaid=True):
@@ -1358,15 +1367,9 @@ class Assistant(object):
         t.start()
 
         self.add_item_to_cart(sku_ids={sku_id: num})
-
-        for count in range(1, retry + 1):
-            logger.info('第[%s/%s]次尝试提交订单', count, retry)
-            if self.submit_order():
-                break
-            logger.info('休息%ss', interval)
-            time.sleep(interval)
-        else:
-            logger.info('执行结束，提交订单失败！')
+        
+        #统一使用submit_order_with_retry实现订单提交失败重试功能
+        self.submit_order_with_retry(retry, interval)
 
     @check_login
     def buy_item_in_stock(self, sku_ids, area, wait_all=False, stock_interval=3, submit_retry=3, submit_interval=5):
